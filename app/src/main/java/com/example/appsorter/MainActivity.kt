@@ -2,6 +2,7 @@ package com.example.appsorter
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
@@ -17,7 +18,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -26,24 +26,26 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 
 const val EXTRA_CATEGORY = "category"
 
@@ -53,6 +55,8 @@ data class AppItem(
     val category: String,
     val overridden: Boolean
 )
+
+data class EditTarget(val name: String, val isNew: Boolean)
 
 class CategoryStyle(val emoji: String, val color: Int)
 
@@ -79,8 +83,27 @@ private val categoryStyles = mapOf(
     "Other" to CategoryStyle("📦", 0xFF9E9E9E.toInt())
 )
 
+private val customPalette = listOf(
+    0xFF5C6BC0, 0xFF26A69A, 0xFFEF5350, 0xFFFFA726, 0xFF8E24AA, 0xFF00897B
+).map { it.toInt() }
+
 fun styleOf(cat: String): CategoryStyle =
-    categoryStyles[cat] ?: CategoryStyle("📦", 0xFF9E9E9E.toInt())
+    categoryStyles[cat]
+        ?: CategoryStyle("📁", customPalette[(cat.hashCode() and 0x7fffffff) % customPalette.size])
+
+fun loadNames(prefs: SharedPreferences): List<String> {
+    val raw = prefs.getString("names", "[]") ?: "[]"
+    return try {
+        val a = JSONArray(raw)
+        (0 until a.length()).map { a.getString(it) }
+    } catch (e: Exception) {
+        emptyList()
+    }
+}
+
+fun saveNames(prefs: SharedPreferences, names: List<String>) {
+    prefs.edit().putString("names", JSONArray(names).toString()).apply()
+}
 
 class MainActivity : ComponentActivity() {
     private var startCategory by mutableStateOf<String?>(null)
@@ -215,11 +238,13 @@ fun pinCategoryShortcut(context: Context, category: String) {
 fun SorterScreen(startCategory: String?, refreshTick: Int) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("overrides", Context.MODE_PRIVATE) }
+    val folderPrefs = remember { context.getSharedPreferences("folders", Context.MODE_PRIVATE) }
     var apps by remember { mutableStateOf<List<AppItem>?>(null) }
+    var customNames by remember { mutableStateOf(loadNames(folderPrefs)) }
     var localTick by remember { mutableIntStateOf(0) }
-    var expanded by remember { mutableStateOf(setOf<String>()) }
     var query by remember { mutableStateOf("") }
-    val listState = rememberLazyListState()
+    var openFolder by remember { mutableStateOf<String?>(null) }
+    var editing by remember { mutableStateOf<EditTarget?>(null) }
 
     LaunchedEffect(refreshTick, localTick) {
         apps = withContext(Dispatchers.Default) { loadApps(context) }
@@ -227,12 +252,7 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
 
     val loaded = apps != null
     LaunchedEffect(startCategory, loaded) {
-        val list = apps
-        if (startCategory != null && list != null) {
-            expanded = setOf(startCategory)
-            val idx = categoryOrder.filter { c -> list.any { it.category == c } }.indexOf(startCategory)
-            if (idx >= 0) listState.animateScrollToItem(idx + 1)
-        }
+        if (startCategory != null && loaded) openFolder = startCategory
     }
 
     Scaffold { pad ->
@@ -242,93 +262,325 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
                 CircularProgressIndicator()
             }
         } else {
-            val filtered = if (query.isBlank()) list
-            else list.filter { it.label.contains(query.trim(), ignoreCase = true) }
-            val groups = filtered.groupBy { it.category }
-            val ordered = categoryOrder.filter { it in groups }.map { it to groups.getValue(it) }
-            val searching = query.isNotBlank()
+            val baseNames = categoryOrder.filter { it != "Other" } + customNames + "Other"
+            val groups = list.groupBy { it.category }
+            val extra = groups.keys.filter { it !in baseNames }
+            val menuFolders = baseNames + extra
+            val folders = menuFolders
+                .filter { it in groups || it in customNames }
+                .map { it to (groups[it] ?: emptyList()) }
 
-            LazyColumn(
-                state = listState,
-                contentPadding = PaddingValues(
-                    start = 16.dp,
-                    end = 16.dp,
-                    top = pad.calculateTopPadding() + 8.dp,
-                    bottom = pad.calculateBottomPadding() + 24.dp
+            val searching = query.isNotBlank()
+            val results = if (searching) list.filter { it.label.contains(query.trim(), ignoreCase = true) }
+            else emptyList()
+
+            val launch: (AppItem) -> Unit = { app ->
+                context.packageManager.getLaunchIntentForPackage(app.pkg)
+                    ?.let { context.startActivity(it) }
+            }
+            val move: (AppItem, String) -> Unit = { app, folder ->
+                prefs.edit().putString(app.pkg, folder).apply()
+                localTick++
+            }
+            val reset: (AppItem) -> Unit = { app ->
+                prefs.edit().remove(app.pkg).apply()
+                localTick++
+            }
+            val info: (AppItem) -> Unit = { app ->
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + app.pkg)
+                    )
                 )
-            ) {
-                item(key = "header") {
-                    Column(Modifier.padding(bottom = 8.dp)) {
-                        Text(
-                            "App Sorter",
-                            style = MaterialTheme.typography.headlineLarge,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            list.size.toString() + " apps in " +
-                                list.map { it.category }.distinct().size + " categories",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        val trailing: (@Composable () -> Unit)? = if (query.isNotEmpty()) {
-                            {
+            }
+
+            Box(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    contentPadding = PaddingValues(
+                        start = 16.dp,
+                        end = 16.dp,
+                        top = pad.calculateTopPadding() + 8.dp,
+                        bottom = pad.calculateBottomPadding() + 24.dp
+                    )
+                ) {
+                    item(key = "header") {
+                        Column(Modifier.padding(bottom = 8.dp)) {
+                            Text(
+                                "App Sorter",
+                                style = MaterialTheme.typography.headlineLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                list.size.toString() + " apps in " + folders.size + " folders",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            val trailing: (@Composable () -> Unit)? = if (query.isNotEmpty()) {
+                                ({
+                                    Text(
+                                        "✕",
+                                        modifier = Modifier.clickable { query = "" }.padding(12.dp)
+                                    )
+                                })
+                            } else null
+                            OutlinedTextField(
+                                value = query,
+                                onValueChange = { query = it },
+                                placeholder = { Text("Search apps") },
+                                singleLine = true,
+                                shape = RoundedCornerShape(28.dp),
+                                trailingIcon = trailing,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            FilledTonalButton(onClick = { editing = EditTarget("", true) }) {
+                                Text("＋ New folder")
+                            }
+                        }
+                    }
+                    if (searching) {
+                        if (results.isEmpty()) {
+                            item(key = "empty") {
                                 Text(
-                                    "✕",
-                                    modifier = Modifier.clickable { query = "" }.padding(12.dp)
+                                    "No apps match your search",
+                                    modifier = Modifier.padding(24.dp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                        } else null
-                        OutlinedTextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            placeholder = { Text("Search apps") },
-                            singleLine = true,
-                            shape = RoundedCornerShape(28.dp),
-                            trailingIcon = trailing,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
-                if (ordered.isEmpty()) {
-                    item(key = "empty") {
-                        Text(
-                            "No apps match your search",
-                            modifier = Modifier.padding(24.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-                ordered.forEach { (cat, catApps) ->
-                    item(key = cat) {
-                        CategoryCard(
-                            cat = cat,
-                            apps = catApps,
-                            open = searching || cat in expanded,
-                            onToggle = {
-                                expanded = if (cat in expanded) expanded - cat else expanded + cat
-                            },
-                            onPin = { pinCategoryShortcut(context, cat) },
-                            onLaunch = { app ->
-                                context.packageManager.getLaunchIntentForPackage(app.pkg)
-                                    ?.let { context.startActivity(it) }
-                            },
-                            onMove = { app, newCat ->
-                                prefs.edit().putString(app.pkg, newCat).apply()
-                                localTick++
-                            },
-                            onReset = { app ->
-                                prefs.edit().remove(app.pkg).apply()
-                                localTick++
-                            },
-                            onInfo = { app ->
-                                val i = Intent(
-                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                    Uri.parse("package:" + app.pkg)
-                                )
-                                context.startActivity(i)
+                        }
+                        results.chunked(4).forEachIndexed { i, row ->
+                            item(key = "result_" + i) {
+                                Row(Modifier.fillMaxWidth()) {
+                                    row.forEach { app ->
+                                        AppCell(
+                                            app = app,
+                                            modifier = Modifier.weight(1f),
+                                            folders = menuFolders,
+                                            onLaunch = { launch(app) },
+                                            onMove = { f -> move(app, f) },
+                                            onReset = { reset(app) },
+                                            onInfo = { info(app) }
+                                        )
+                                    }
+                                    repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                                }
                             }
-                        )
+                        }
+                    } else {
+                        folders.chunked(2).forEach { pair ->
+                            item(key = "folders_" + pair.first().first) {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                                ) {
+                                    pair.forEach { (n, a) ->
+                                        FolderTile(
+                                            name = n,
+                                            apps = a,
+                                            modifier = Modifier.weight(1f),
+                                            onClick = { openFolder = n }
+                                        )
+                                    }
+                                    if (pair.size == 1) Spacer(Modifier.weight(1f))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val open = openFolder
+                if (open != null) {
+                    FolderDialog(
+                        name = open,
+                        apps = list.filter { it.category == open },
+                        folders = menuFolders,
+                        onDismiss = { openFolder = null },
+                        onPin = { pinCategoryShortcut(context, open) },
+                        onEdit = { editing = EditTarget(open, false) },
+                        onLaunch = launch,
+                        onMove = move,
+                        onReset = reset,
+                        onInfo = info
+                    )
+                }
+
+                val edit = editing
+                if (edit != null) {
+                    val custom = edit.isNew || edit.name in customNames
+                    val folderApps = list.filter { it.category == edit.name }
+                    val deleteAction: (() -> Unit)? = if (custom && !edit.isNew) {
+                        ({
+                            val ed = prefs.edit()
+                            folderApps.forEach { ed.remove(it.pkg) }
+                            ed.apply()
+                            val names = customNames.filter { it != edit.name }
+                            customNames = names
+                            saveNames(folderPrefs, names)
+                            editing = null
+                            openFolder = null
+                            localTick++
+                        })
+                    } else null
+                    EditFolderDialog(
+                        initialName = edit.name,
+                        isNew = edit.isNew,
+                        custom = custom,
+                        allApps = list,
+                        initialSelected = if (edit.isNew) emptySet()
+                        else folderApps.map { it.pkg }.toSet(),
+                        takenNames = menuFolders.filter { it != edit.name },
+                        onDismiss = { editing = null },
+                        onSave = { newName, selected ->
+                            val oldName = edit.name
+                            val byPkg = list.associateBy { it.pkg }
+                            val current: Set<String> =
+                                if (edit.isNew) emptySet() else folderApps.map { it.pkg }.toSet()
+                            val ed = prefs.edit()
+                            if (custom) {
+                                val names = if (edit.isNew) customNames + newName
+                                else customNames.map { if (it == oldName) newName else it }
+                                customNames = names
+                                saveNames(folderPrefs, names)
+                            }
+                            selected.forEach { pkg ->
+                                if (oldName != newName || byPkg[pkg]?.category != newName) {
+                                    ed.putString(pkg, newName)
+                                }
+                            }
+                            (current - selected).forEach { pkg ->
+                                if (custom) ed.remove(pkg) else ed.putString(pkg, "Other")
+                            }
+                            ed.apply()
+                            localTick++
+                            editing = null
+                            openFolder = newName
+                        },
+                        onDelete = deleteAction
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AppIcon(pkg: String, modifier: Modifier) {
+    val context = LocalContext.current
+    val icon = remember(pkg) {
+        runCatching {
+            context.packageManager.getApplicationIcon(pkg).toBitmap(96, 96).asImageBitmap()
+        }.getOrNull()
+    }
+    if (icon != null) Image(icon, contentDescription = null, modifier = modifier)
+    else Spacer(modifier)
+}
+
+@Composable
+fun FolderTile(name: String, apps: List<AppItem>, modifier: Modifier, onClick: () -> Unit) {
+    val st = styleOf(name)
+    Column(
+        modifier.clip(RoundedCornerShape(24.dp)).clickable(onClick = onClick).padding(4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            Modifier.fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(32.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                .padding(12.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (apps.isEmpty()) {
+                Text(st.emoji, style = MaterialTheme.typography.displayMedium)
+            } else {
+                Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.SpaceEvenly) {
+                    for (r in 0 until 3) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            for (c in 0 until 3) {
+                                val a = apps.getOrNull(r * 3 + c)
+                                Box(Modifier.weight(1f).aspectRatio(1f).padding(3.dp)) {
+                                    if (a != null) AppIcon(a.pkg, Modifier.fillMaxSize())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            name,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            apps.size.toString() + (if (apps.size == 1) " app" else " apps"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+fun FolderDialog(
+    name: String,
+    apps: List<AppItem>,
+    folders: List<String>,
+    onDismiss: () -> Unit,
+    onPin: () -> Unit,
+    onEdit: () -> Unit,
+    onLaunch: (AppItem) -> Unit,
+    onMove: (AppItem, String) -> Unit,
+    onReset: (AppItem) -> Unit,
+    onInfo: (AppItem) -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        styleOf(name).emoji + " " + name,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = onEdit) { Text("✎ Edit") }
+                    TextButton(onClick = onPin) { Text("📌") }
+                }
+                Spacer(Modifier.height(8.dp))
+                if (apps.isEmpty()) {
+                    Text(
+                        "No apps yet. Tap Edit to add some.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp)
+                    )
+                } else {
+                    Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+                        apps.chunked(4).forEach { row ->
+                            Row(Modifier.fillMaxWidth()) {
+                                row.forEach { app ->
+                                    AppCell(
+                                        app = app,
+                                        modifier = Modifier.weight(1f),
+                                        folders = folders,
+                                        onLaunch = { onLaunch(app) },
+                                        onMove = { f -> onMove(app, f) },
+                                        onReset = { onReset(app) },
+                                        onInfo = { onInfo(app) }
+                                    )
+                                }
+                                repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                            }
+                        }
                     }
                 }
             }
@@ -337,65 +589,112 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
 }
 
 @Composable
-fun CategoryCard(
-    cat: String,
-    apps: List<AppItem>,
-    open: Boolean,
-    onToggle: () -> Unit,
-    onPin: () -> Unit,
-    onLaunch: (AppItem) -> Unit,
-    onMove: (AppItem, String) -> Unit,
-    onReset: (AppItem) -> Unit,
-    onInfo: (AppItem) -> Unit
+fun EditFolderDialog(
+    initialName: String,
+    isNew: Boolean,
+    custom: Boolean,
+    allApps: List<AppItem>,
+    initialSelected: Set<String>,
+    takenNames: List<String>,
+    onDismiss: () -> Unit,
+    onSave: (String, Set<String>) -> Unit,
+    onDelete: (() -> Unit)?
 ) {
-    val st = styleOf(cat)
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
-    ) {
-        Row(
-            Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
+    var name by remember { mutableStateOf(initialName) }
+    var selected by remember { mutableStateOf(initialSelected) }
+    var nameError by remember { mutableStateOf(false) }
+    val sortedApps = remember {
+        allApps.sortedWith(
+            compareByDescending<AppItem> { it.pkg in initialSelected }.thenBy { it.label.lowercase() }
+        )
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh
         ) {
-            Box(
-                Modifier.size(44.dp).clip(CircleShape).background(Color(st.color).copy(alpha = 0.25f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(st.emoji, style = MaterialTheme.typography.titleLarge)
-            }
-            Spacer(Modifier.width(14.dp))
-            Column(Modifier.weight(1f)) {
-                Text(cat, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Column(Modifier.padding(16.dp)) {
                 Text(
-                    apps.size.toString() + (if (apps.size == 1) " app" else " apps"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    if (isNew) "New folder" else "Edit folder",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
                 )
-            }
-            FilledTonalButton(
-                onClick = onPin,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-            ) { Text("📌 Pin") }
-            Spacer(Modifier.width(8.dp))
-            Text(if (open) "▴" else "▾", style = MaterialTheme.typography.titleMedium)
-        }
-        AnimatedVisibility(visible = open) {
-            Column(Modifier.padding(start = 8.dp, end = 8.dp, bottom = 12.dp)) {
-                apps.chunked(4).forEach { row ->
-                    Row(Modifier.fillMaxWidth()) {
-                        row.forEach { app ->
-                            AppCell(
-                                app = app,
-                                modifier = Modifier.weight(1f),
-                                onLaunch = { onLaunch(app) },
-                                onMove = { c -> onMove(app, c) },
-                                onReset = { onReset(app) },
-                                onInfo = { onInfo(app) }
+                if (custom) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it; nameError = false },
+                        label = { Text("Folder name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    )
+                } else {
+                    Text(
+                        initialName,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+                Text(
+                    "Choose apps (" + selected.size + " selected)",
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
+                )
+                LazyColumn(Modifier.heightIn(max = 380.dp)) {
+                    items(sortedApps, key = { it.pkg }) { a ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable {
+                                    selected = if (a.pkg in selected) selected - a.pkg else selected + a.pkg
+                                }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(checked = a.pkg in selected, onCheckedChange = null)
+                            Spacer(Modifier.width(12.dp))
+                            AppIcon(a.pkg, Modifier.size(32.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Text(
+                                a.label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
                     }
+                }
+                if (nameError) {
+                    Text(
+                        "Pick a unique folder name",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (onDelete != null) {
+                        TextButton(
+                            onClick = onDelete,
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            )
+                        ) { Text("Delete") }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("Cancel") }
+                    Button(onClick = {
+                        val n = name.trim()
+                        if (custom) {
+                            val clash = takenNames.any { it.equals(n, ignoreCase = true) }
+                            if (n.isEmpty() || clash) nameError = true
+                            else onSave(n, selected)
+                        } else {
+                            onSave(initialName, selected)
+                        }
+                    }) { Text("Save") }
                 }
             }
         }
@@ -407,17 +706,12 @@ fun CategoryCard(
 fun AppCell(
     app: AppItem,
     modifier: Modifier,
+    folders: List<String>,
     onLaunch: () -> Unit,
     onMove: (String) -> Unit,
     onReset: () -> Unit,
     onInfo: () -> Unit
 ) {
-    val context = LocalContext.current
-    val icon = remember(app.pkg) {
-        runCatching {
-            context.packageManager.getApplicationIcon(app.pkg).toBitmap(128, 128).asImageBitmap()
-        }.getOrNull()
-    }
     var menu by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
 
@@ -429,8 +723,7 @@ fun AppCell(
                 .padding(vertical = 8.dp, horizontal = 2.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (icon != null) Image(icon, contentDescription = null, modifier = Modifier.size(52.dp))
-            else Spacer(Modifier.size(52.dp))
+            AppIcon(app.pkg, Modifier.size(52.dp))
             Spacer(Modifier.height(6.dp))
             Text(
                 app.label,
@@ -445,7 +738,7 @@ fun AppCell(
             onDismissRequest = { menu = false; moving = false }
         ) {
             if (!moving) {
-                DropdownMenuItem(text = { Text("Move to category…") }, onClick = { moving = true })
+                DropdownMenuItem(text = { Text("Move to folder…") }, onClick = { moving = true })
                 if (app.overridden) {
                     DropdownMenuItem(
                         text = { Text("Reset to automatic") },
@@ -454,10 +747,10 @@ fun AppCell(
                 }
                 DropdownMenuItem(text = { Text("App info") }, onClick = { menu = false; onInfo() })
             } else {
-                categoryOrder.forEach { c ->
+                folders.forEach { f ->
                     DropdownMenuItem(
-                        text = { Text(styleOf(c).emoji + "  " + c) },
-                        onClick = { menu = false; moving = false; onMove(c) }
+                        text = { Text(styleOf(f).emoji + "  " + f) },
+                        onClick = { menu = false; moving = false; onMove(f) }
                     )
                 }
             }
