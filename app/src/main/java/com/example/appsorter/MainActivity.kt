@@ -1,5 +1,7 @@
 package com.example.appsorter
 
+import android.app.AppOpsManager
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -16,13 +18,16 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -46,8 +51,10 @@ import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 
 const val EXTRA_CATEGORY = "category"
+const val RARELY = "Rarely used"
 
 data class AppItem(
     val label: String,
@@ -80,7 +87,8 @@ private val categoryStyles = mapOf(
     "Health & Fitness" to CategoryStyle("💪", 0xFFFF7043.toInt()),
     "News" to CategoryStyle("📰", 0xFF8D6E63.toInt()),
     "Tools" to CategoryStyle("🔧", 0xFF78909C.toInt()),
-    "Other" to CategoryStyle("📦", 0xFF9E9E9E.toInt())
+    "Other" to CategoryStyle("📦", 0xFF9E9E9E.toInt()),
+    RARELY to CategoryStyle("🕸️", 0xFF607D8B.toInt())
 )
 
 private val customPalette = listOf(
@@ -203,35 +211,141 @@ fun loadApps(context: Context): List<AppItem> {
         .sortedBy { it.label.lowercase() }
 }
 
-fun categoryIcon(cat: String): Icon {
-    val st = styleOf(cat)
+@Suppress("DEPRECATION")
+fun hasUsageAccess(context: Context): Boolean {
+    return try {
+        val ops = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        ops.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            android.os.Process.myUid(),
+            context.packageName
+        ) == AppOpsManager.MODE_ALLOWED
+    } catch (e: Exception) {
+        false
+    }
+}
+
+fun rarelyUsed(context: Context, apps: List<AppItem>): List<AppItem> {
+    return try {
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val now = System.currentTimeMillis()
+        val day = 24L * 60 * 60 * 1000
+        val stats = usm.queryAndAggregateUsageStats(now - 90 * day, now)
+        val cutoff = now - 30 * day
+        val pm = context.packageManager
+        apps.filter { app ->
+            val last = stats[app.pkg]?.lastTimeUsed ?: 0L
+            val installed = try {
+                pm.getPackageInfo(app.pkg, 0).firstInstallTime
+            } catch (e: Exception) {
+                0L
+            }
+            last < cutoff && installed < cutoff
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+}
+
+fun appsForFolder(context: Context, name: String, all: List<AppItem>): List<AppItem> {
+    if (name == RARELY) {
+        return if (hasUsageAccess(context)) rarelyUsed(context, all) else emptyList()
+    }
+    return all.filter { it.category == name }
+}
+
+fun exportBackup(context: Context): String {
+    val prefs = context.getSharedPreferences("overrides", Context.MODE_PRIVATE)
+    val folderPrefs = context.getSharedPreferences("folders", Context.MODE_PRIVATE)
+    val obj = JSONObject()
+    obj.put("names", JSONArray(loadNames(folderPrefs)))
+    val ov = JSONObject()
+    prefs.all.forEach { (k, v) -> if (v is String) ov.put(k, v) }
+    obj.put("overrides", ov)
+    return obj.toString(2)
+}
+
+fun importBackup(context: Context, json: String): Boolean {
+    return try {
+        val obj = JSONObject(json)
+        val arr = obj.getJSONArray("names")
+        val names = (0 until arr.length()).map { arr.getString(it) }
+        val ov = obj.getJSONObject("overrides")
+        val ed = context.getSharedPreferences("overrides", Context.MODE_PRIVATE).edit()
+        ed.clear()
+        ov.keys().forEach { k -> ed.putString(k, ov.getString(k)) }
+        ed.apply()
+        saveNames(context.getSharedPreferences("folders", Context.MODE_PRIVATE), names)
+        true
+    } catch (e: Exception) {
+        false
+    }
+}
+
+fun categoryIcon(context: Context, cat: String, apps: List<AppItem>): Icon {
     val size = 432
     val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bmp)
-    canvas.drawColor(st.color)
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    paint.textSize = 170f
-    paint.textAlign = Paint.Align.CENTER
-    val y = size / 2f - (paint.descent() + paint.ascent()) / 2f
-    canvas.drawText(st.emoji, size / 2f, y, paint)
+    canvas.drawColor(0xFF2E3036.toInt())
+    if (apps.isEmpty()) {
+        val st = styleOf(cat)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.textSize = 170f
+        paint.textAlign = Paint.Align.CENTER
+        val y = size / 2f - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText(st.emoji, size / 2f, y, paint)
+    } else {
+        val start = 84
+        val cell = 88
+        val iconSize = 72
+        val gap = (cell - iconSize) / 2
+        val pm = context.packageManager
+        apps.take(9).forEachIndexed { i, app ->
+            val ib = runCatching {
+                pm.getApplicationIcon(app.pkg).toBitmap(iconSize, iconSize)
+            }.getOrNull()
+            if (ib != null) {
+                val left = start + (i % 3) * cell + gap
+                val top = start + (i / 3) * cell + gap
+                canvas.drawBitmap(ib, left.toFloat(), top.toFloat(), null)
+            }
+        }
+    }
     return Icon.createWithAdaptiveBitmap(bmp)
 }
 
-fun pinCategoryShortcut(context: Context, category: String) {
+fun pinCategoryShortcut(context: Context, category: String, apps: List<AppItem>) {
     val sm = context.getSystemService(ShortcutManager::class.java)
     if (sm == null || !sm.isRequestPinShortcutSupported) {
         Toast.makeText(context, "Your launcher doesn't support pinned shortcuts", Toast.LENGTH_LONG).show()
         return
     }
-    val intent = Intent(context, MainActivity::class.java)
+    val intent = Intent(context, FolderPopupActivity::class.java)
         .setAction(Intent.ACTION_VIEW)
         .putExtra(EXTRA_CATEGORY, category)
     val info = ShortcutInfo.Builder(context, "cat_" + category.replace(" ", "_"))
         .setShortLabel(category)
-        .setIcon(categoryIcon(category))
+        .setIcon(categoryIcon(context, category, apps))
         .setIntent(intent)
         .build()
     sm.requestPinShortcut(info, null)
+}
+
+fun refreshPinnedShortcuts(context: Context, apps: List<AppItem>) {
+    try {
+        val sm = context.getSystemService(ShortcutManager::class.java) ?: return
+        val updated = sm.pinnedShortcuts.mapNotNull { sc ->
+            val scIntent = sc.intent ?: return@mapNotNull null
+            val cat = scIntent.getStringExtra(EXTRA_CATEGORY) ?: return@mapNotNull null
+            ShortcutInfo.Builder(context, sc.id)
+                .setShortLabel(sc.shortLabel ?: cat)
+                .setIcon(categoryIcon(context, cat, appsForFolder(context, cat, apps)))
+                .setIntent(scIntent)
+                .build()
+        }
+        if (updated.isNotEmpty()) sm.updateShortcuts(updated)
+    } catch (e: Exception) {
+    }
 }
 
 @Composable
@@ -240,14 +354,64 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
     val prefs = remember { context.getSharedPreferences("overrides", Context.MODE_PRIVATE) }
     val folderPrefs = remember { context.getSharedPreferences("folders", Context.MODE_PRIVATE) }
     var apps by remember { mutableStateOf<List<AppItem>?>(null) }
+    var rarely by remember { mutableStateOf<List<AppItem>?>(null) }
     var customNames by remember { mutableStateOf(loadNames(folderPrefs)) }
     var localTick by remember { mutableIntStateOf(0) }
     var query by remember { mutableStateOf("") }
     var openFolder by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf<EditTarget?>(null) }
 
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val ok = try {
+                context.contentResolver.openOutputStream(uri)?.use {
+                    it.write(exportBackup(context).toByteArray())
+                }
+                true
+            } catch (e: Exception) {
+                false
+            }
+            Toast.makeText(context, if (ok) "Backup saved" else "Backup failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val text = try {
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            } catch (e: Exception) {
+                null
+            }
+            val ok = text != null && importBackup(context, text)
+            if (ok) {
+                customNames = loadNames(folderPrefs)
+                localTick++
+            }
+            Toast.makeText(context, if (ok) "Backup restored" else "Restore failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     LaunchedEffect(refreshTick, localTick) {
-        apps = withContext(Dispatchers.Default) { loadApps(context) }
+        val result = withContext(Dispatchers.Default) {
+            val l = loadApps(context)
+            val r = if (hasUsageAccess(context)) rarelyUsed(context, l) else null
+            Pair(l, r)
+        }
+        apps = result.first
+        rarely = result.second
+    }
+
+    LaunchedEffect(apps) {
+        val l = apps
+        if (l != null) {
+            withContext(Dispatchers.Default) {
+                refreshPinnedShortcuts(context, l)
+                updateAllWidgets(context, l)
+            }
+        }
     }
 
     val loaded = apps != null
@@ -269,6 +433,7 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
             val folders = menuFolders
                 .filter { it in groups || it in customNames }
                 .map { it to (groups[it] ?: emptyList()) }
+            val tiles = folders + (RARELY to (rarely ?: emptyList()))
 
             val searching = query.isNotBlank()
             val results = if (searching) list.filter { it.label.contains(query.trim(), ignoreCase = true) }
@@ -335,8 +500,19 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
                                 modifier = Modifier.fillMaxWidth()
                             )
                             Spacer(Modifier.height(8.dp))
-                            FilledTonalButton(onClick = { editing = EditTarget("", true) }) {
-                                Text("＋ New folder")
+                            Row(
+                                Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                FilledTonalButton(onClick = { editing = EditTarget("", true) }) {
+                                    Text("＋ New folder")
+                                }
+                                FilledTonalButton(onClick = {
+                                    exportLauncher.launch("app-sorter-backup.json")
+                                }) { Text("⬆ Backup") }
+                                FilledTonalButton(onClick = {
+                                    importLauncher.launch(arrayOf("*/*"))
+                                }) { Text("⬇ Restore") }
                             }
                         }
                     }
@@ -369,18 +545,28 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
                             }
                         }
                     } else {
-                        folders.chunked(2).forEach { pair ->
+                        tiles.chunked(2).forEach { pair ->
                             item(key = "folders_" + pair.first().first) {
                                 Row(
                                     Modifier.fillMaxWidth().padding(vertical = 8.dp),
                                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                                 ) {
                                     pair.forEach { (n, a) ->
+                                        val needsAccess = n == RARELY && rarely == null
                                         FolderTile(
                                             name = n,
                                             apps = a,
                                             modifier = Modifier.weight(1f),
-                                            onClick = { openFolder = n }
+                                            subtitle = if (needsAccess) "Tap to allow usage access" else null,
+                                            onClick = {
+                                                if (needsAccess) {
+                                                    context.startActivity(
+                                                        Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                                                    )
+                                                } else {
+                                                    openFolder = n
+                                                }
+                                            }
                                         )
                                     }
                                     if (pair.size == 1) Spacer(Modifier.weight(1f))
@@ -392,17 +578,20 @@ fun SorterScreen(startCategory: String?, refreshTick: Int) {
 
                 val open = openFolder
                 if (open != null) {
+                    val openApps = if (open == RARELY) (rarely ?: emptyList())
+                    else list.filter { it.category == open }
                     FolderDialog(
                         name = open,
-                        apps = list.filter { it.category == open },
+                        apps = openApps,
                         folders = menuFolders,
                         onDismiss = { openFolder = null },
-                        onPin = { pinCategoryShortcut(context, open) },
+                        onPin = { pinCategoryShortcut(context, open, openApps) },
                         onEdit = { editing = EditTarget(open, false) },
                         onLaunch = launch,
                         onMove = move,
                         onReset = reset,
-                        onInfo = info
+                        onInfo = info,
+                        showEdit = open != RARELY
                     )
                 }
 
@@ -478,7 +667,13 @@ fun AppIcon(pkg: String, modifier: Modifier) {
 }
 
 @Composable
-fun FolderTile(name: String, apps: List<AppItem>, modifier: Modifier, onClick: () -> Unit) {
+fun FolderTile(
+    name: String,
+    apps: List<AppItem>,
+    modifier: Modifier,
+    subtitle: String? = null,
+    onClick: () -> Unit
+) {
     val st = styleOf(name)
     Column(
         modifier.clip(RoundedCornerShape(24.dp)).clickable(onClick = onClick).padding(4.dp),
@@ -518,7 +713,7 @@ fun FolderTile(name: String, apps: List<AppItem>, modifier: Modifier, onClick: (
             overflow = TextOverflow.Ellipsis
         )
         Text(
-            apps.size.toString() + (if (apps.size == 1) " app" else " apps"),
+            subtitle ?: (apps.size.toString() + (if (apps.size == 1) " app" else " apps")),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -536,7 +731,9 @@ fun FolderDialog(
     onLaunch: (AppItem) -> Unit,
     onMove: (AppItem, String) -> Unit,
     onReset: (AppItem) -> Unit,
-    onInfo: (AppItem) -> Unit
+    onInfo: (AppItem) -> Unit,
+    showPin: Boolean = true,
+    showEdit: Boolean = true
 ) {
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -553,13 +750,14 @@ fun FolderDialog(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
-                    TextButton(onClick = onEdit) { Text("✎ Edit") }
-                    TextButton(onClick = onPin) { Text("📌") }
+                    if (showEdit) TextButton(onClick = onEdit) { Text("✎ Edit") }
+                    if (showPin) TextButton(onClick = onPin) { Text("📌") }
                 }
                 Spacer(Modifier.height(8.dp))
                 if (apps.isEmpty()) {
                     Text(
-                        "No apps yet. Tap Edit to add some.",
+                        if (name == RARELY) "Nothing here. You've used all your apps recently."
+                        else "No apps yet. Tap Edit to add some.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 16.dp)
                     )
